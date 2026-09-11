@@ -1,0 +1,1 @@
+PyInstaller --add-data "assets;assets" tke_chamada_antecipada.py
