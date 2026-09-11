@@ -1,289 +1,308 @@
-import flet as ft
 import os
-import webbrowser  # Para abrir o link no navegador
-from tke_functions import ThyssenCommunication
+import sys
 
-tke = ThyssenCommunication()
+# Empacotado com --noconsole o PyInstaller deixa stdout/stderr em None, e qualquer
+# print() dentro do app quebra. Redireciona antes de importar quem imprime.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+
+import threading
+import tkinter as tk
+import webbrowser
+from tkinter import messagebox, ttk
+
+from serial.tools import list_ports
+
+from tke_functions import TRANSPORT_IP, TRANSPORT_SERIAL, ThyssenCommunication
+
+WINDOW_WIDTH = 1200
+WINDOW_HEIGHT = 700
+
+TEXTO_MCO = (
+    "Mapeia qual MCO atende cada pavimento de destino.\n\n"
+    "Formato: 1:4,6,7-18;2:20-99\n"
+    "MCO 1 atende os pavimentos 4, 6 e 7 a 18; MCO 2 atende 20 a 99.\n\n"
+    "Uma entrada sem faixa (ex.: 2) vale como padrão para qualquer pavimento "
+    "não mapeado."
+)
+
+TEXTO_PAVIMENTO = (
+    "Deslocamento subtraído dos andares de origem e destino antes do envio, "
+    "para casar a numeração do controle de acesso com a do elevador.\n\n"
+    "Ex.: ajuste -2 faz o andar 1 do controle virar 3 para o TKE."
+)
+
+TEXTO_DISCLAIMER = (
+    "Este aplicativo não possui qualquer relação com os fabricantes de "
+    "elevadores aqui citados."
+)
 
 
-def main(page: ft.Page):
-    page.title = "TKE | Chamada antecipada"
-    page.window_width = 700
-    page.window_height = 700
-    page.padding = 20
+def listar_portas_com():
+    portas = sorted(p.device for p in list_ports.comports() if p.device.upper().startswith("COM"))
+    return portas or [f"COM{i}" for i in range(1, 10)]
 
-    # Dropdown com 4 itens
-    dropdown = ft.Dropdown(
-        width=400,
-        label="Tipo de conexão",
-        options=[
-            ft.dropdown.Option("Modbus RTU - Serial"),
-            # ft.dropdown.Option("Modbus - IP"),
-            # ft.dropdown.Option("Modbus - Access Control")
-        ],
-    )
 
-    # Remover quando outras opções estiverem disponíveis
-    dropdown.value = "Modbus RTU - Serial"
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.tke = ThyssenCommunication()
 
-    comm_port_list = ft.Dropdown(
-        width=200,
-        label="Porta COM",
-        options=[
-            ft.dropdown.Option("COM1"),
-            ft.dropdown.Option("COM2"),
-            ft.dropdown.Option("COM3"),
-            ft.dropdown.Option("COM4"),
-            ft.dropdown.Option("COM5"),
-            ft.dropdown.Option("COM6"),
-            ft.dropdown.Option("COM7"),
-            ft.dropdown.Option("COM8"),
-            ft.dropdown.Option("COM9")
-        ],
-    )
+        root.title("TKE | Chamada antecipada")
+        root.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
+        root.minsize(900, 600)
 
-    # Campos de entrada
-    gateway = ft.TextField(label="Endereço Gateway", width=200)
-    ajuste_pavimento = ft.TextField(label="Ajuste de pavimento", width=200)
-    mcos_dest = ft.TextField(label="MCOs de destino", width=200)
-    comm_port = ft.TextField(label="Porta COM", width=200)
-    andar_origem = ft.TextField(label="Andar Origem", width=200)
-    andar_destino = ft.TextField(label="Andar Destino", width=200)
-    dispositivo = ft.TextField(label="Dispositivo", width=200)
+        self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        self._set_icone()
+        self._build()
 
-    conn_status = ft.Text("Não conectado", size=15, weight=ft.FontWeight.BOLD, color=ft.Colors.RED)
+    def _set_icone(self):
+        # Sem isto a janela fica com a pena padrão do Tk na barra de título.
+        try:
+            self.icone = tk.PhotoImage(file=os.path.join(self.base_dir, "assets", "logo_tke.png"))
+            self.root.iconphoto(True, self.icone)
+        except tk.TclError:
+            pass
 
-    # Valor padrão do gateway é 1
-    gateway.value = 1
+    # ------------------------------------------------------------- interface
 
-    # Campo para informações do backend
-    info_backend = ft.TextField(
-        # label="Mensagens",
-        width=700,
-        height=550,
-        multiline=True,
-        min_lines=25,
-        max_lines=25,
-        read_only=True
-    )
+    def _build(self):
+        outer = ttk.Frame(self.root, padding=16)
+        outer.pack(fill="both", expand=True)
+        outer.columnconfigure(1, weight=1)
+        outer.rowconfigure(0, weight=1)
 
-    def fazer_chamada(e):
-        # Função que será chamada quando o botão for pressionado
+        esquerda = ttk.Frame(outer)
+        esquerda.grid(row=0, column=0, sticky="nw", padx=(0, 16))
+
+        self._build_logo(esquerda)
+        self._build_conexao(esquerda)
+        self._build_chamada(esquerda)
+
+        self._build_log(outer)
+        self._build_rodape(outer)
+
+    def _build_logo(self, parent):
+        try:
+            # subsample(2) reduz 270x119 -> 135x59 sem depender do Pillow.
+            self.logo = tk.PhotoImage(file=os.path.join(self.base_dir, "assets", "logo_tke.png")).subsample(2, 2)
+            ttk.Label(parent, image=self.logo).pack(anchor="w", pady=(0, 12))
+        except tk.TclError:
+            ttk.Label(parent, text="TKE", font=("Segoe UI", 20, "bold")).pack(anchor="w", pady=(0, 12))
+
+    def _build_conexao(self, parent):
+        box = ttk.LabelFrame(parent, text="Conexão", padding=10)
+        box.pack(fill="x", pady=(0, 12))
+
+        ttk.Label(box, text="Tipo de conexão").grid(row=0, column=0, sticky="w")
+        self.transporte = tk.StringVar(value=TRANSPORT_SERIAL)
+        combo = ttk.Combobox(box, textvariable=self.transporte, state="readonly", width=42,
+                             values=[TRANSPORT_SERIAL, TRANSPORT_IP])
+        combo.grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 10))
+        combo.bind("<<ComboboxSelected>>", self.transporte_mudou)
+
+        # Linha da serial e linha do IP ocupam a mesma célula; só uma fica visível.
+        self.linha_serial = ttk.Frame(box)
+        self.linha_serial.grid(row=2, column=0, columnspan=3, sticky="w")
+        ttk.Label(self.linha_serial, text="Porta COM").grid(row=0, column=0, sticky="w")
+        self.comm_port = tk.StringVar()
+        portas = listar_portas_com()
+        self.combo_porta = ttk.Combobox(self.linha_serial, textvariable=self.comm_port,
+                                        state="readonly", width=12, values=portas)
+        self.combo_porta.grid(row=1, column=0, sticky="w")
+        ttk.Button(self.linha_serial, text="Atualizar", width=10,
+                   command=self.atualizar_portas).grid(row=1, column=1, padx=(8, 0))
+
+        self.linha_tcp = ttk.Frame(box)
+        self.linha_tcp.grid(row=2, column=0, columnspan=3, sticky="w")
+        ttk.Label(self.linha_tcp, text="IP do conversor").grid(row=0, column=0, sticky="w")
+        self.tke_ip = tk.StringVar()
+        ttk.Entry(self.linha_tcp, textvariable=self.tke_ip, width=20).grid(row=1, column=0, sticky="w")
+        ttk.Label(self.linha_tcp, text="Porta TCP").grid(row=0, column=1, sticky="w", padx=(10, 0))
+        self.tke_port = tk.StringVar(value="502")
+        ttk.Entry(self.linha_tcp, textvariable=self.tke_port, width=10).grid(row=1, column=1, sticky="w", padx=(10, 0))
+        self.linha_tcp.grid_remove()
+
+        acoes = ttk.Frame(box)
+        acoes.grid(row=3, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        self.botao_conexao = ttk.Button(acoes, text="Conectar", width=18, command=self.conectar)
+        self.botao_conexao.grid(row=0, column=0, sticky="w")
+        self.status = ttk.Label(acoes, text="Não conectado", foreground="#c0392b",
+                                font=("Segoe UI", 10, "bold"))
+        self.status.grid(row=0, column=1, sticky="w", padx=(12, 0))
+
+    def _build_chamada(self, parent):
+        box = ttk.LabelFrame(parent, text="Chamada", padding=10)
+        box.pack(fill="x")
+
+        self.gateway = tk.StringVar(value="1")
+        self.mcos_dest = tk.StringVar()
+        self.dispositivo = tk.StringVar()
+        self.ajuste_pavimento = tk.StringVar()
+        self.andar_origem = tk.StringVar()
+        self.andar_destino = tk.StringVar()
+
+        self.label_gateway = self._campo(box, 0, 0, "Endereço Gateway", self.gateway)
+        self._campo(box, 0, 1, "MCOs de destino", self.mcos_dest,
+                    ajuda=("MCOs de destino", TEXTO_MCO))
+        self._campo(box, 1, 0, "Dispositivo", self.dispositivo)
+        self._campo(box, 1, 1, "Ajuste de pavimento", self.ajuste_pavimento,
+                    ajuda=("Ajuste de pavimento", TEXTO_PAVIMENTO))
+        self._campo(box, 2, 0, "Andar Origem", self.andar_origem)
+        self._campo(box, 2, 1, "Andar Destino", self.andar_destino)
+
+        self.botao_chamada = ttk.Button(box, text="Fazer Chamada", command=self.fazer_chamada,
+                                        state="disabled")
+        self.botao_chamada.grid(row=3, column=0, columnspan=3, sticky="we", pady=(14, 0))
+
+    def _campo(self, parent, linha, coluna, rotulo, variavel, ajuda=None):
+        col = coluna * 2
+        quadro = ttk.Frame(parent)
+        quadro.grid(row=linha, column=col, sticky="w", padx=(0, 16), pady=(0, 8))
+
+        topo = ttk.Frame(quadro)
+        topo.pack(anchor="w")
+        label = ttk.Label(topo, text=rotulo)
+        label.pack(side="left")
+        if ajuda:
+            titulo, texto = ajuda
+            ttk.Button(topo, text="?", width=2,
+                       command=lambda: messagebox.showinfo(titulo, texto, parent=self.root)
+                       ).pack(side="left", padx=(6, 0))
+
+        ttk.Entry(quadro, textvariable=variavel, width=22).pack(anchor="w")
+        return label
+
+    def _build_log(self, parent):
+        box = ttk.LabelFrame(parent, text="Logs da Conexão", padding=8)
+        box.grid(row=0, column=1, sticky="nsew")
+        box.rowconfigure(0, weight=1)
+        box.columnconfigure(0, weight=1)
+
+        self.log = tk.Text(box, wrap="word", state="disabled", font=("Consolas", 9),
+                           background="#fbfbfb", relief="flat")
+        self.log.grid(row=0, column=0, sticky="nsew")
+        barra = ttk.Scrollbar(box, orient="vertical", command=self.log.yview)
+        barra.grid(row=0, column=1, sticky="ns")
+        self.log.configure(yscrollcommand=barra.set)
+
+    def _build_rodape(self, parent):
+        rodape = ttk.Frame(parent)
+        rodape.grid(row=1, column=0, columnspan=2, sticky="e", pady=(10, 0))
+
+        link = ttk.Label(rodape, text="Desenvolvido por Raphael Pires",
+                         foreground="#1a6fb5", cursor="hand2", font=("Segoe UI", 9, "underline"))
+        link.pack(side="left")
+        link.bind("<Button-1>", lambda e: webbrowser.open(
+            "https://www.linkedin.com/in/sp-raphael/?locale=en_US"))
+
+        ttk.Button(rodape, text="?", width=2,
+                   command=lambda: messagebox.showinfo("Sobre", TEXTO_DISCLAIMER, parent=self.root)
+                   ).pack(side="left", padx=(8, 0))
+
+    # ----------------------------------------------------------------- ações
+
+    def atualizar_portas(self):
+        portas = listar_portas_com()
+        self.combo_porta.configure(values=portas)
+        if self.comm_port.get() not in portas:
+            self.comm_port.set("")
+
+    def transporte_mudou(self, _evento=None):
+        # Trocar de transporte derruba a conexão atual: os campos mudam de sentido.
+        self.tke.disconnect()
+        self.marcar_desconectado()
+
+        usa_ip = self.transporte.get() == TRANSPORT_IP
+        if usa_ip:
+            self.linha_serial.grid_remove()
+            self.linha_tcp.grid()
+        else:
+            self.linha_tcp.grid_remove()
+            self.linha_serial.grid()
+        # O endereço do gateway é o escravo Modbus nos dois casos: primeiro byte
+        # do frame RTU, ou unit_id no MBAP. Mesmo campo, mesmo valor.
+        self.label_gateway.configure(text="Endereço Gateway")
+
+    def marcar_desconectado(self):
+        self.status.configure(text="Não conectado", foreground="#c0392b")
+        self.botao_chamada.configure(state="disabled")
+
+    def escrever_log(self, texto):
+        self.log.configure(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.insert("1.0", texto or "")
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    def _em_thread(self, tarefa, ao_terminar):
+        """O I/O serial/TCP pode levar segundos; fora da thread da UI ela congela."""
+        self.botao_conexao.configure(state="disabled")
+        self.botao_chamada.configure(state="disabled")
+
+        def worker():
+            try:
+                resultado = tarefa()
+            except Exception as ex:  # noqa: BLE001 - erro inesperado vai para o log
+                resultado = ("Error: %s" % ex, False)
+            self.root.after(0, lambda: ao_terminar(resultado))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def conectar(self):
+        if self.transporte.get() == TRANSPORT_IP:
+            self.escrever_log(f"Trying to connect on {self.tke_ip.get()}:{self.tke_port.get()}...")
+            tarefa = lambda: self.tke.open_gateway_ip(  # noqa: E731
+                self.tke_ip.get(), self.tke_port.get(), self.gateway.get())
+        else:
+            self.escrever_log(f"Trying to connect on {self.comm_port.get()}...")
+            tarefa = lambda: self.tke.open_terminal_loop(self.comm_port.get())  # noqa: E731
+
+        self._em_thread(tarefa, self._conexao_terminou)
+
+    def _conexao_terminou(self, resultado):
+        reply, conectado = resultado
+        self.botao_conexao.configure(state="normal")
+
+        if conectado:
+            self.status.configure(text="Conectado", foreground="#1e8449")
+            self.botao_chamada.configure(state="normal")
+        else:
+            self.marcar_desconectado()
+
+        self.escrever_log(reply)
+
+    def fazer_chamada(self):
         dados = {
-            "item_selecionado": dropdown.value,
-            "gateway": gateway.value,
-            "ajuste_pavimento": ajuste_pavimento.value,
-            "mco_destino": mcos_dest.value,
-            "com_port": comm_port_list.value,
-            "andar_origem": andar_origem.value,
-            "andar_destino": andar_destino.value,
-            "dispositivo": dispositivo.value
+            "item_selecionado": self.transporte.get(),
+            "gateway": self.gateway.get(),
+            "ajuste_pavimento": self.ajuste_pavimento.get(),
+            "mco_destino": self.mcos_dest.get(),
+            "andar_origem": self.andar_origem.get(),
+            "andar_destino": self.andar_destino.get(),
+            "dispositivo": self.dispositivo.get(),
         }
-        print("Dados coletados:", dados)
-        reply = tke.send_message(dados)
-        info_backend.value = reply
-        page.update()
+        self._em_thread(lambda: self.tke.send_message(dados), self._chamada_terminou)
 
-    def conectar(e):
-        info_backend.value = f"Trying to connect on {comm_port_list.value}..."
-        page.update()
+    def _chamada_terminou(self, resultado):
+        self.botao_conexao.configure(state="normal")
+        if self.tke.is_connected():
+            self.botao_chamada.configure(state="normal")
+        self.escrever_log(resultado if isinstance(resultado, str) else resultado[0])
 
-        reply, conected = tke.open_terminal_loop(comm_port_list.value)
 
-        # conected = True
-        if conected:
-            conn_status.value = "Conectado"
-            conn_status.color = ft.Colors.GREEN
+def main():
+    root = tk.Tk()
+    try:
+        ttk.Style().theme_use("vista")
+    except tk.TclError:
+        pass
+    app = App(root)
+    root.protocol("WM_DELETE_WINDOW", lambda: (app.tke.disconnect(), root.destroy()))
+    root.mainloop()
 
-            botao_chamada.disabled = False
-            botao_chamada.tooltip = None
-
-        info_backend.value = reply
-        page.update()
-
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    logo_path = os.path.join(current_dir, "assets\\logo_tke.png")
-
-    # Para imagem local (arquivo no seu computador)
-    logo_local = ft.Image(
-        src=logo_path,
-        width=130,  # largura em pixels
-        height=130,  # altura em pixels
-        fit=ft.ImageFit.CONTAIN  # mantém a proporção da imagem
-    )
-
-    logo_container = ft.Container(
-        content=logo_local,
-        alignment=ft.alignment.top_left,
-        margin=ft.margin.only(left=20, top=0)  # 20 pixels de margem à esquerda e topo
-    )
-    
-    dlg_mco = ft.AlertDialog(
-        title=ft.Text("Texto explicando configuração do MCO", size=18)
-    )
-
-    info_mco = ft.IconButton(
-        icon=ft.icons.INFO_OUTLINE,
-        on_click=lambda e: page.open(dlg_mco)
-    )
-
-    dlg_pavimento = ft.AlertDialog(
-        title=ft.Text("Texto ajuste de pavimento")
-    )
-
-    info_pavimento = ft.IconButton(
-        icon=ft.icons.INFO_OUTLINE,
-        on_click=lambda e: page.open(dlg_pavimento)
-    )
-
-    # Botão de fazer chamada
-    botao_chamada = ft.ElevatedButton(
-        text="Fazer Chamada",
-        on_click=fazer_chamada,
-        width=410,
-        disabled=True,
-        tooltip="COM Port not connected"
-    )
-
-    botao_conexao = ft.ElevatedButton(
-        text="Conectar",
-        on_click=conectar,
-        width=200,
-    )
-
-    connection_row = ft.Row(
-        controls=[
-            comm_port_list,
-            ft.VerticalDivider(width=10),
-            conn_status,
-        ],
-        spacing=5,
-        alignment=ft.MainAxisAlignment.START,
-    )
-
-    row_1 = ft.Row(
-        controls=[
-            gateway,
-            ft.VerticalDivider(width=10),
-            mcos_dest,
-            info_mco
-        ],
-        spacing=5,
-        alignment=ft.MainAxisAlignment.START,
-    )
-
-    row_2 = ft.Row(
-        controls=[
-            dispositivo,
-            ft.VerticalDivider(width=10),
-            ajuste_pavimento,
-            info_pavimento
-        ],
-        spacing=5,
-        alignment=ft.MainAxisAlignment.START,
-    )
-
-    row_3 = ft.Row(
-        controls=[
-            andar_origem,
-            ft.VerticalDivider(width=10),
-            andar_destino,
-        ],
-        spacing=5,
-        alignment=ft.MainAxisAlignment.START,
-    )
-
-    # Criando o layout em duas colunas
-    coluna_esquerda = ft.Column(
-        controls=[
-            dropdown,
-            ft.Divider(),
-            connection_row,
-            botao_conexao,
-            ft.Divider(),
-            row_1,
-            row_2,
-            row_3,
-            ft.Divider(),
-            botao_chamada,
-        ],
-        spacing=10,
-    )
-
-    coluna_direita = ft.Column(
-        controls=[
-            ft.Text("Logs da Conexão", size=20, weight=ft.FontWeight.BOLD),
-            info_backend,
-        ],
-        spacing=10,
-    )
-
-    # Criando um layout vertical com logo e conteúdo principal
-    layout_esq = ft.Column(
-        controls=[
-            logo_container,
-            coluna_esquerda
-        ],
-        spacing=10,
-        alignment=ft.MainAxisAlignment.START,
-    )
-
-    layout = ft.Row(
-        controls=[
-            layout_esq,
-            ft.VerticalDivider(width=30),
-            coluna_direita,
-        ],
-        spacing=0,
-        alignment=ft.MainAxisAlignment.START,
-    )
-
-    # Link no canto inferior direito
-    def abrir_link(e):
-        webbrowser.open("https://www.linkedin.com/in/sp-raphael/?locale=en_US")  # Substitua pelo link desejado
-
-    link_desenvolvimento = ft.TextButton(
-        content=ft.Text(
-            "Desenvolvido por Raphael Pires",  # Substitua pelo texto desejado
-            size=12,
-            color=ft.Colors.BLUE,
-            weight=ft.FontWeight.W_600,
-            style=ft.TextStyle(decoration=ft.TextDecoration.UNDERLINE),
-        ),
-        on_click=abrir_link,  # Agora funciona
-    )
-
-    container_link = ft.Container(
-        content=link_desenvolvimento,
-        alignment=ft.alignment.bottom_right,
-        # margin=ft.margin.only(right=20, bottom=20),
-    )
-
-    # dlg_mco = ft.AlertDialog(
-    #     title=ft.Text("Texto explicando configuração do MCO", size=18)
-    # )
-
-    info_dev = ft.IconButton(
-        icon=ft.icons.INFO_OUTLINE,
-        on_click=lambda e: page.open(
-            ft.AlertDialog(
-                title=ft.Text("Este aplicativo não possui qualquer relação com os fabricantes de elevadores aqui citados.", size=18)
-            )
-        )
-    )
-
-    # Agrupa o ícone info_mco e o link de desenvolvimento em uma linha
-    footer_row = ft.Row(
-        controls=[
-            container_link,  # Link de desenvolvimento
-            info_dev,  # Ícone de informação sobre o MCO
-        ],
-        alignment=ft.MainAxisAlignment.END,  # Alinha a linha no canto inferior direito
-        spacing=2,  # Espaçamento entre os componentes
-    )
-
-    # Adicionando o layout e o link à página
-    page.add(layout, footer_row)
 
 if __name__ == "__main__":
-    ft.app(target=main)
+    main()
