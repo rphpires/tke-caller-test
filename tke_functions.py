@@ -3,7 +3,6 @@ import time
 from datetime import datetime
 
 import serial
-from pyModbusTCP.client import ModbusClient
 
 import crc16
 
@@ -27,6 +26,8 @@ MODBUS_FUNC_WRITE_MULTIPLE_REGISTERS = 0x10
 MODBUS_START_REGISTER = 0x0000
 MODBUS_REGISTER_COUNT = 8
 MODBUS_REPLY_LEN = 8  # slave + func + addr(2) + n_reg(2) + crc(2)
+MBAP_HEADER_LEN = 7   # tid(2) + protocolo(2) + tamanho(2) + unit_id(1)
+MBAP_REPLY_LEN = MBAP_HEADER_LEN + 5  # + func + addr(2) + n_reg(2), sem CRC
 
 SERIAL_BAUD_RATE = 19200
 SERIAL_STALE_SECONDS = 5
@@ -64,7 +65,6 @@ class ThyssenCommunication:
         self.transport = None
         self.device_fd = None
         self.comm_port = None
-        self._client = None
         self._sock = None
         self.ip = None
         self.port = None
@@ -86,12 +86,11 @@ class ThyssenCommunication:
 
     def disconnect(self):
         self.close_port()
-        self.close_modbus_client()
         self.close_socket()
         self.transport = None
 
     def is_connected(self):
-        return bool(self.device_fd or self._client or self._sock)
+        return bool(self.device_fd or self._sock)
 
     def _parse_endereco(self, ip, port):
         """Valida ip/porta vindos da UI. Devolve (porta, mensagem_de_erro)."""
@@ -155,22 +154,20 @@ class ThyssenCommunication:
         if not self._abrir_socket(ip, port):
             return self.reply_msg, False
 
-        try:
-            # auto_close=False: reabrir a conexao a cada chamada custa um handshake
-            # TCP inteiro dentro do tempo de resposta do elevador.
-            self._client = ModbusClient(
-                host=ip, port=port, unit_id=unit_id,
-                timeout=TCP_TIMEOUT, auto_open=True, auto_close=False
-            )
-        except ValueError as ex:
-            self._client = None
-            self.print_msg(f"Error: Unable to create Modbus client: {ex}")
-
+        # Um socket so. O conversor RS485<->TCP costuma aceitar um unico cliente:
+        # abrir uma segunda conexao para o mesmo ip:port so rende recusa. Os dois
+        # enquadramentos (MBAP e RTU cru) viajam por esta mesma conexao.
         self.transport = TRANSPORT_IP
+        # O tipo do conversor nao muda entre reconexoes no mesmo endereco, entao
+        # a deteccao so recomeca quando o endereco muda.
+        if (ip, port) != (self.ip, self.port):
+            self._ip_mode = None
         self.ip, self.port = ip, port
-        self._ip_mode = None
         self.print_msg(f"Connected on {ip}:{port}")
-        self.print_msg("O tipo de conversor sera detectado no primeiro envio.")
+        if self._ip_mode:
+            self.print_msg(f"Conversor ja conhecido: {self._ip_mode}")
+        else:
+            self.print_msg("O tipo de conversor sera detectado no primeiro envio.")
         self.print_msg("Conversor transparente precisa estar em %s bps, 8 bits, "
                        "paridade PAR (even), 1 stop bit." % SERIAL_BAUD_RATE)
         return self.reply_msg, True
@@ -184,6 +181,46 @@ class ThyssenCommunication:
             self.print_msg(f"Error: Unable to connect on {ip}:{port}: {ex}")
             return False
         return True
+
+    def _garantir_socket(self):
+        if self._sock is not None:
+            return True
+        return self._abrir_socket(self.ip, self.port)
+
+    def _recv_exato(self, total):
+        """recv pode fatiar a resposta; o frame so serve completo."""
+        buf = b""
+        try:
+            while len(buf) < total:
+                pedaco = self._sock.recv(total - len(buf))
+                if not pedaco:
+                    # recv vazio = o outro lado fechou; nao adianta reusar o socket.
+                    self.print_msg("  conexao fechada pelo conversor")
+                    self.close_socket()
+                    break
+                buf += pedaco
+        except socket.timeout:
+            pass
+        return buf
+
+    def _drenar_socket(self):
+        """Descarta sobras do enquadramento errado: elas chegariam no lugar da
+        resposta seguinte e deslocariam o frame inteiro."""
+        if not self._sock:
+            return
+        try:
+            self._sock.settimeout(0.05)
+            while True:
+                if not self._sock.recv(256):
+                    break
+        except OSError:
+            pass
+        finally:
+            if self._sock:
+                try:
+                    self._sock.settimeout(TCP_TIMEOUT)
+                except OSError:
+                    pass
 
     def close_socket(self):
         if not self._sock:
@@ -204,16 +241,6 @@ class ThyssenCommunication:
             pass
         finally:
             self.device_fd = None
-
-    def close_modbus_client(self):
-        if not self._client:
-            return
-        try:
-            self._client.close()
-        except Exception:
-            pass
-        finally:
-            self._client = None
 
     # --------------------------------------------------------------- chamada
 
@@ -290,20 +317,31 @@ class ThyssenCommunication:
 
     # ------------------------------------------------------- transporte RTU
 
+    def build_pdu(self, registers):
+        """PDU do write multiple registers. RTU embrulha com escravo+CRC, Modbus
+        TCP com o header MBAP: so muda a casca."""
+        pdu = [MODBUS_FUNC_WRITE_MULTIPLE_REGISTERS]  # Funcao
+        pdu += u16(MODBUS_START_REGISTER)             # Registro inicial
+        pdu += u16(MODBUS_REGISTER_COUNT)             # N de registros
+        pdu += [MODBUS_REGISTER_COUNT * 2]            # N de bytes de dados
+        for register in registers:
+            pdu += u16(register)
+        return pdu
+
     def build_rtu_frame(self, gateway, registers):
         """Frame Modbus RTU completo, com CRC. Igual na serial e no socket cru."""
-        msg = [
-            gateway & 0xFF,                          # Endereco do escravo
-            MODBUS_FUNC_WRITE_MULTIPLE_REGISTERS,    # Funcao
-        ]
-        msg += u16(MODBUS_START_REGISTER)            # Registro inicial
-        msg += u16(MODBUS_REGISTER_COUNT)            # N de registros
-        msg += [MODBUS_REGISTER_COUNT * 2]           # N de bytes de dados
-        for register in registers:
-            msg += u16(register)
-
+        msg = [gateway & 0xFF] + self.build_pdu(registers)
         crc = crc16.calcBytes(msg, 0xFFFF)
         return bytes(msg + [crc & 0xFF, (crc >> 8) & 0xFF])  # Modbus: CRC low byte first
+
+    def build_mbap_frame(self, gateway, registers, tid):
+        """Frame Modbus TCP: header MBAP + PDU, sem CRC (o TCP ja garante)."""
+        pdu = self.build_pdu(registers)
+        header = u16(tid)                  # Transaction ID, ecoado na resposta
+        header += u16(0)                   # Protocol ID: 0 = Modbus
+        header += u16(len(pdu) + 1)        # Tamanho: unit_id + PDU
+        header += [gateway & 0xFF]         # Unit ID = escravo do lado serial
+        return bytes(header + pdu)
 
     def __send_modbus_rtu(self, gateway, registers):
         msg = self.build_rtu_frame(gateway, registers)
@@ -350,7 +388,7 @@ class ThyssenCommunication:
     def __send_ip(self, gateway, registers):
         """Tenta os dois enquadramentos e memoriza o que o conversor aceitar."""
         tentativas = {
-            IP_MODE_MODBUS_TCP: lambda: self.__try_modbus_tcp(registers),
+            IP_MODE_MODBUS_TCP: lambda: self.__try_modbus_tcp(gateway, registers),
             IP_MODE_RTU: lambda: self.__try_rtu_over_tcp(gateway, registers),
         }
 
@@ -383,47 +421,75 @@ class ThyssenCommunication:
         msg = self.build_rtu_frame(gateway, registers)
         self.print_msg("RTU cru = %s" % (" ".join("0x%02X" % b for b in msg)))
 
-        try:
-            if self._sock is None and not self._abrir_socket(self.ip, self.port):
-                return False
-
-            self._sock.sendall(msg)
-            reply = self._sock.recv(MODBUS_REPLY_LEN)
-            if not reply:
-                # recv vazio = o outro lado fechou; nao adianta reusar o socket.
-                self.print_msg("  sem resposta: conexao fechada pelo conversor")
-                self.close_socket()
-                return False
-
-            self.print_msg(f"  resposta de {len(reply)} bytes: {[hex(b) for b in reply]}")
-            return True
-
-        except socket.timeout:
-            self.print_msg("  sem resposta em %ss (RTU cru)" % TCP_TIMEOUT)
+        reply = self.__trocar_frame(msg, MODBUS_REPLY_LEN, "RTU cru")
+        if not reply:
             return False
+
+        # Um gateway Modbus TCP responderia com MBAP, sem CRC. So o eco do proprio
+        # TKE fecha o CRC, entao ele e a prova de que o conversor e transparente.
+        if len(reply) < 4:
+            self.print_msg("  resposta curta demais para um frame RTU")
+            self._drenar_socket()
+            return False
+
+        corpo = list(reply[:-2])
+        crc_recebido = reply[-2] | (reply[-1] << 8)  # Modbus: CRC low byte first
+        if crc16.calcBytes(corpo, 0xFFFF) != crc_recebido:
+            self.print_msg("  CRC invalido: a resposta nao e um eco RTU")
+            self._drenar_socket()
+            return False
+
+        if corpo[0] != (gateway & 0xFF):
+            self.print_msg("  eco do escravo %s; esperado %s" % (corpo[0], gateway & 0xFF))
+            self._drenar_socket()
+            return False
+
+        return True
+
+    def __try_modbus_tcp(self, gateway, registers):
+        tid = self.msg_count & 0xFFFF
+        msg = self.build_mbap_frame(gateway, registers, tid)
+        self.print_msg("Modbus TCP = %s" % (" ".join("0x%02X" % b for b in msg)))
+
+        reply = self.__trocar_frame(msg, MBAP_REPLY_LEN, "Modbus TCP")
+        if not reply:
+            return False
+
+        # Conversor transparente devolve o eco RTU (8 bytes, com CRC) ou nada. So
+        # um gateway de verdade responde com MBAP: protocolo 0 e o mesmo tid.
+        if len(reply) <= MBAP_HEADER_LEN or reply[:4] != bytes(u16(tid) + u16(0)):
+            self.print_msg("  resposta nao e MBAP: nao e gateway Modbus TCP")
+            self._drenar_socket()
+            return False
+
+        funcao = reply[MBAP_HEADER_LEN]
+        if funcao & 0x80:  # bit alto ligado = resposta de excecao
+            codigo = reply[MBAP_HEADER_LEN + 1] if len(reply) > MBAP_HEADER_LEN + 1 else 0
+            self.print_msg("  gateway recusou: excecao Modbus 0x%02X" % codigo)
+            return False
+
+        self.print_msg("  aceito por %s:%s (unit_id=%s)" % (self.ip, self.port, gateway & 0xFF))
+        return True
+
+    def __trocar_frame(self, msg, tamanho_resposta, rotulo):
+        """Envia o frame e le a resposta no socket unico da conexao."""
+        if not self._garantir_socket():
+            return b""
+
+        try:
+            self._sock.sendall(msg)
+            reply = self._recv_exato(tamanho_resposta)
         except OSError as ex:
             self.print_msg(f"  erro de socket: {ex}")
             self.close_socket()
-            return False
+            return b""
 
-    def __try_modbus_tcp(self, registers):
-        if not self._client:
-            return False
+        if not reply:
+            self.print_msg("  sem resposta em %ss (%s)" % (TCP_TIMEOUT, rotulo))
+            return b""
 
-        self.print_msg(f"Modbus TCP registers = {registers}")
-        if not self._client.is_open and not self._client.open():
-            self.print_msg(f"  nao reconectou: {self._client.last_error_as_txt}")
-            return False
-
-        if self._client.write_multiple_registers(MODBUS_START_REGISTER, registers):
-            self.print_msg("  aceito por %s:%s (unit_id=%s)"
-                           % (self._client.host, self._client.port, self._client.unit_id))
-            return True
-
-        self.print_msg("  recusado: %s / %s" % (self._client.last_error_as_txt,
-                                                self._client.last_except_as_txt))
-        self._client.close()
-        return False
+        self.print_msg(f"  resposta de {len(reply)} bytes: {[hex(b) for b in reply]}")
+        return reply
 
     # ------------------------------------------------------------------- MCO
 
